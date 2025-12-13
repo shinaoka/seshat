@@ -15,6 +15,27 @@
 use std::{cmp::Ordering, collections::HashMap};
 
 use rusqlite::{params, params_from_iter, ToSql};
+use serde_json::Value;
+
+/// Remove `state_key: null` from a serialized event JSON string.
+///
+/// Seshat stores events as-is, but some clients (like Element-Web) may include
+/// `"state_key": null` for non-state events. The matrix-js-sdk checks for the
+/// presence of `state_key` to determine if an event is a state event, so having
+/// `state_key: null` causes non-state events to be misidentified as state events.
+fn remove_null_state_key(source: &str) -> String {
+    if let Ok(mut json) = serde_json::from_str::<Value>(source) {
+        if json.get("state_key") == Some(&Value::Null) {
+            if let Some(obj) = json.as_object_mut() {
+                obj.remove("state_key");
+                if let Ok(cleaned) = serde_json::to_string(&json) {
+                    return cleaned;
+                }
+            }
+        }
+    }
+    source.to_string()
+}
 
 #[cfg(test)]
 use r2d2::PooledConnection;
@@ -782,7 +803,8 @@ impl Database {
             for row in context {
                 let (source, sender, profile) = row?;
                 profiles.insert(sender?, profile);
-                ret.push(source?)
+                let source_str: String = source?;
+                ret.push(remove_null_state_key(&source_str))
             }
 
             ret
@@ -826,7 +848,8 @@ impl Database {
             for row in context {
                 let (source, sender, profile) = row?;
                 profiles.insert(sender?, profile);
-                ret.push(source?)
+                let source_str: String = source?;
+                ret.push(remove_null_state_key(&source_str))
             }
 
             ret
@@ -944,7 +967,7 @@ impl Database {
 
             let result = SearchResult {
                 score: scores.remove(&event.event_id).unwrap(),
-                event_source: event.source,
+                event_source: remove_null_state_key(&event.source),
                 events_before: before,
                 events_after: after,
                 profile_info: profiles,
@@ -993,5 +1016,45 @@ impl Database {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_remove_null_state_key() {
+        // Event with state_key: null should have it removed
+        let input = r#"{"event_id":"$abc","type":"m.room.message","state_key":null,"content":{"body":"test"}}"#;
+        let result = remove_null_state_key(input);
+        assert!(!result.contains("state_key"));
+        assert!(result.contains("event_id"));
+        assert!(result.contains("m.room.message"));
+    }
+
+    #[test]
+    fn test_remove_null_state_key_preserves_valid_state_key() {
+        // Event with a valid state_key should keep it
+        let input = r#"{"event_id":"$abc","type":"m.room.name","state_key":"","content":{"name":"Room"}}"#;
+        let result = remove_null_state_key(input);
+        assert!(result.contains("state_key"));
+        assert!(result.contains("\"state_key\":\"\""));
+    }
+
+    #[test]
+    fn test_remove_null_state_key_no_state_key() {
+        // Event without state_key should remain unchanged
+        let input = r#"{"event_id":"$abc","type":"m.room.message","content":{"body":"test"}}"#;
+        let result = remove_null_state_key(input);
+        assert_eq!(result, input);
+    }
+
+    #[test]
+    fn test_remove_null_state_key_invalid_json() {
+        // Invalid JSON should return the original string
+        let input = "not valid json";
+        let result = remove_null_state_key(input);
+        assert_eq!(result, input);
     }
 }
